@@ -1,0 +1,216 @@
+// =============================================================================
+// RangeProofVerifier — proves `attestation.value >= threshold` without
+// revealing the value, where the attestation was published by a registered
+// issuer.
+//
+// Implements:
+//   FR-3.1  proveIncomeAtLeast circuit with the specified public/private split.
+//   FR-3.2  Browser-proving target: ≤4s.
+//   FR-3.3  Verification ≤200ms.
+//   FR-3.4  No leak of `value` through public inputs.
+//
+// Design rationale (see contracts/README.md):
+//   Issuers publish *commitments* of attestations to a per-issuer ledger map
+//   when they "issue" one. The holder proves membership in that map alongside
+//   range/freshness/nullifier constraints. This sidesteps in-circuit signature
+//   verification (ed25519 ≈ 2M constraints — hostile to browser proving) and
+//   is the documented pattern from example-bboard + OpenZeppelin's
+//   AccessControl.compact.
+//
+// Cross-references for every API call below:
+//   - `Map.insert / Map.lookup / Map.member`:
+//     https://github.com/OpenZeppelin/compact-contracts/blob/main/contracts/src/access/AccessControl.compact (lines 173,234,326,381)
+//   - `Set.member / Set.insert`:
+//     https://github.com/OpenZeppelin/compact-contracts/blob/main/contracts/src/access/ShieldedAccessControl.compact (lines 551,557,649)
+//   - `persistentHash<Vector<N, Bytes<32>>>([elements])`:
+//     https://github.com/OpenZeppelin/compact-contracts/blob/main/contracts/src/access/ShieldedAccessControl.compact (lines 687,711,779)
+//   - `Counter.increment`: example-counter, example-bboard.
+//   - `blockTimeLt`: stdlib per Compact reference (still pending MCP verification).
+// =============================================================================
+
+pragma language_version >= 0.16 && <= 0.23;
+
+import CompactStandardLibrary;
+
+// -----------------------------------------------------------------------------
+// Ledger state
+// -----------------------------------------------------------------------------
+
+// Per-issuer set of attestation commitments. Outer key: issuerId. Inner key:
+// commitment hash. Value: presence boolean. This nesting is the only shape
+// verified-working in production OZ code (AccessControl._operatorRoles).
+// Avoid Map<K, Set<V>> until that combination is confirmed in stdlib.
+export ledger issuedCommitments: Map<Bytes<32>, Map<Bytes<32>, Boolean>>;
+
+// Spent nullifiers. Per the Sismo/Polygon-ID pattern, the nullifier is
+// scope-bound to (subjectSecret, verifierId, claimType, issuerId): unlinkable
+// across verifiers, consistent within a (verifier, claim, issuer) triple.
+export ledger spentNullifiers: Set<Bytes<32>>;
+
+// Monotonic counter — read by the explorer / off-chain indexers for stats.
+export ledger commitmentsIssued: Counter;
+export ledger proofsAccepted: Counter;
+
+// -----------------------------------------------------------------------------
+// Witness declarations (implemented in witnesses.ts)
+// -----------------------------------------------------------------------------
+
+// The holder's long-term secret. Persisted in their local private state.
+// Used to derive subject commitment and verifier-scoped nullifiers.
+witness holderSecret(): Bytes<32>;
+
+// The attestation the holder is proving over. Pulled from local store at
+// proving time. The TS witness validates the issuer's off-chain ed25519
+// signature before returning, so the circuit can treat these as "from a
+// trusted issuer envelope" — the binding anchor is still the in-circuit
+// commitment-membership check.
+witness attestationValue(): Uint<64>;
+witness attestationNonce(): Bytes<32>;
+witness attestationExpiresAt(): Uint<64>;
+witness attestationClaimType(): Bytes<32>;
+
+// -----------------------------------------------------------------------------
+// Circuits
+// -----------------------------------------------------------------------------
+
+// Called by an issuer to publish a new attestation commitment to the chain.
+// The actual (value, nonce, expiresAt, claimType, subject) are private to the
+// issuer + holder; only their hash hits the ledger.
+//
+// Production note: this should be gated by the caller proving ownership of
+// the issuer's secret key (AccessControl-style witness check). Permissionless
+// for the hackathon; see SECURITY note in contracts/README.md.
+export circuit issueAttestation(issuerId: Bytes<32>, commitment: Bytes<32>): [] {
+  // SECURITY: permissionless during the hackathon. Post-MVP, gate via a
+  // `witness issuerSecretKey()` check matching `persistentHash` of the
+  // registered issuer's account commitment — AccessControl.compact:421-455
+  // is the exact pattern.
+
+  // Ensure the issuer's bucket exists before inserting into the inner map.
+  // `insertDefault(key)` is the canonical 0.23 pattern — it inserts the zero
+  // value for the map's value_type (an empty inner map here).
+  const dIssuerId = disclose(issuerId);
+  if (!issuedCommitments.member(dIssuerId)) {
+    issuedCommitments.insertDefault(dIssuerId);
+  }
+  issuedCommitments.lookup(dIssuerId).insert(disclose(commitment), true);
+
+  commitmentsIssued.increment(1);
+}
+
+// The main entry: prove a holder's attestation meets a verifier's threshold.
+//
+//   Public inputs:
+//     issuerId    — which registered issuer this attestation came from
+//     threshold   — the lower bound the verifier wants
+//     claimType   — what fact (e.g. hash of "income.monthly")
+//     verifierId  — opaque scope id (binds the nullifier to this verifier)
+//
+//   Witness (private) inputs:
+//     attestationValue, attestationNonce, attestationExpiresAt,
+//     attestationClaimType — the attestation contents
+//     holderSecret — the holder's long-term secret
+//
+//   Returns: the published nullifier (also recorded in `spentNullifiers`).
+//
+// Constraints enforced (in this order):
+//   1. subjectCommitment = persistentHash([secret, "solvnt:subject:v1"])
+//   2. commitment = persistentHash([
+//        value, nonce, subjectCommitment, expiresAt, claimType,
+//        "solvnt:attestation:v1"
+//      ])
+//   3. issuedCommitments[issuerId][commitment] == true
+//   4. attClaimType (witness) == claimType (public)
+//   5. value >= threshold
+//   6. blockTimeLt(expiresAt)
+//   7. nullifier = persistentHash([
+//        secret, verifierId, claimType, issuerId, "solvnt:nullifier:v1"
+//      ])
+//   8. !spentNullifiers.member(nullifier)
+//   9. spentNullifiers.insert(nullifier)
+//
+// All `persistentHash` calls use Vector<N, Bytes<32>> with Uint coerced via
+// `as Field as Bytes<32>` — the production pattern from
+// ShieldedAccessControl.compact (lines 687,711).
+export circuit proveIncomeAtLeast(
+  issuerId: Bytes<32>,
+  threshold: Uint<64>,
+  claimType: Bytes<32>,
+  verifierId: Bytes<32>
+): Bytes<32> {
+  const value = attestationValue();
+  const nonce = attestationNonce();
+  const expiresAt = attestationExpiresAt();
+  const attClaimType = attestationClaimType();
+  const secret = holderSecret();
+
+  // 1. Subject commitment with domain separator — prevents cross-protocol
+  // nullifier-set correlation when the same `secret` is used elsewhere.
+  const subjectCommitment = persistentHash<Vector<2, Bytes<32>>>([
+    secret,
+    pad(32, "solvnt:subject:v1")
+  ]);
+
+  // 2. Recompute the issuer-side commitment from the witnessed attestation.
+  // Uint<64> -> Field -> Bytes<32> coercion is the production pattern (see
+  // bboard.compact line 43 for Counter, FungibleToken.compact:503 for Uint).
+  const commitment = persistentHash<Vector<6, Bytes<32>>>([
+    value as Field as Bytes<32>,
+    nonce,
+    subjectCommitment,
+    expiresAt as Field as Bytes<32>,
+    attClaimType,
+    pad(32, "solvnt:attestation:v1")
+  ]);
+
+  // 3. Membership in the issuer's set of issued commitments.
+  // Guard the outer lookup with .member to avoid UB on missing key (the OZ
+  // AccessControl pattern, lines 173-178). The lookup-then-member chain has to
+  // stay inline — Compact 0.23 forbids binding a nested ledger ADT to a const.
+  // `commitment` is derived from witness values, so disclose() is required
+  // before touching the ledger.
+  const dIssuerId = disclose(issuerId);
+  assert(issuedCommitments.member(dIssuerId), "unknown_issuer");
+  assert(
+    issuedCommitments.lookup(dIssuerId).member(disclose(commitment)),
+    "attestation_not_issued"
+  );
+
+  // 4. Claim type must match the verifier's request. Witness comparison in a
+  // conditional/assert requires disclose() per the implicit-disclosure rule.
+  assert(disclose(attClaimType == claimType), "claim_type_mismatch");
+
+  // 5. Range check. `value` is a witness; comparison flows through assert so
+  // wrap in disclose(). Both operands are Uint<64> so the comparison is
+  // constraint-bound, no field-overflow footgun.
+  assert(disclose(value >= threshold), "threshold_not_met");
+
+  // 6. Freshness — attestation must not have expired at on-chain block time.
+  // `expiresAt` is a witness; `blockTimeLt` requires disclose() on its
+  // argument (confirmed against compact-export/test-center/block-time.compact).
+  assert(blockTimeLt(disclose(expiresAt)), "attestation_expired");
+
+  // 7. Derive the per-verifier-per-claim-per-issuer nullifier with domain
+  // separator. Binding issuerId prevents two different issuers' attestations
+  // for the same (verifier, claimType) from colliding to the same nullifier.
+  const nullifier = persistentHash<Vector<5, Bytes<32>>>([
+    secret,
+    verifierId,
+    claimType,
+    issuerId,
+    pad(32, "solvnt:nullifier:v1")
+  ]);
+
+  // 8 + 9. Atomic: assert-not-spent and insert.
+  assert(!spentNullifiers.member(disclose(nullifier)), "nullifier_already_spent");
+  spentNullifiers.insert(disclose(nullifier));
+
+  proofsAccepted.increment(1);
+
+  return disclose(nullifier);
+}
+
+// Lightweight read circuit — lets a verifier confirm a nullifier was recorded.
+export circuit isNullifierSpent(nullifier: Bytes<32>): Boolean {
+  return spentNullifiers.member(disclose(nullifier));
+}

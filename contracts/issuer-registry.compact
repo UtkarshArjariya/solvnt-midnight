@@ -1,0 +1,68 @@
+// =============================================================================
+// IssuerRegistry — register and look up the public keys of attestation
+// issuers.
+//
+// Implements:
+//   FR-1.1  Permissionless registration of (issuerId, pubkey, label).
+//   FR-1.2  Public `getIssuerPubkey` view.
+//   FR-1.3  Monotonic counter as a cheap event source.
+//   FR-1.4  Permissionless during the hackathon (governance-gated post-MVP).
+//
+// Note on the design: even though we register a "pubkey" here, the
+// range-proof circuit doesn't verify signatures over this pubkey directly —
+// it verifies that the holder's attestation commitment is a member of the
+// issuer's published set of commitments. The pubkey is kept for:
+//   - off-chain UX (holder's app shows the ed25519 signature that signed the
+//     JSON attestation; signature is verified in TS, not in the circuit).
+//   - future migration to a SNARK-friendly Schnorr-over-NativePoint scheme.
+//
+// API surface verified against OpenZeppelin/compact-contracts (Map.insert /
+// Map.lookup / Map.member — AccessControl.compact lines 173,234,326,381).
+// =============================================================================
+
+pragma language_version >= 0.16 && <= 0.23;
+
+import CompactStandardLibrary;
+
+// -----------------------------------------------------------------------------
+// Ledger state
+// -----------------------------------------------------------------------------
+
+// issuerId (32-byte hash of pubkey) → pubkey
+export ledger issuerPubkeys: Map<Bytes<32>, Bytes<32>>;
+
+// issuerId → human-readable label, kept Opaque so the chain doesn't reason
+// about its contents.
+export ledger issuerLabels: Map<Bytes<32>, Opaque<"string">>;
+
+// Monotonic counter of registrations.
+export ledger issuersRegistered: Counter;
+
+// -----------------------------------------------------------------------------
+// Circuits
+// -----------------------------------------------------------------------------
+
+// Register a new issuer. Permissionless per FR-1.4. Re-registering the same
+// (issuerId, pubkey) overwrites — fine for the hackathon's idempotent demo
+// flow but should be governance-gated post-MVP.
+export circuit registerIssuer(
+  issuerId: Bytes<32>,
+  pubkey: Bytes<32>,
+  label: Opaque<"string">
+): [] {
+  issuerPubkeys.insert(disclose(issuerId), disclose(pubkey));
+  issuerLabels.insert(disclose(issuerId), disclose(label));
+  issuersRegistered.increment(1);
+}
+
+// Look up an issuer's pubkey. Guard the lookup with .member to avoid undefined
+// behavior on missing key (the OZ AccessControl pattern, lines 173-178).
+export circuit getIssuerPubkey(issuerId: Bytes<32>): Bytes<32> {
+  assert(issuerPubkeys.member(disclose(issuerId)), "issuer_not_registered");
+  return issuerPubkeys.lookup(disclose(issuerId));
+}
+
+// Check whether an issuerId is registered.
+export circuit hasIssuer(issuerId: Bytes<32>): Boolean {
+  return issuerPubkeys.member(disclose(issuerId));
+}
