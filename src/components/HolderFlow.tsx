@@ -11,6 +11,7 @@ import { useWallet } from '@/lib/wallet';
 import { loadAttestations, claimLabel } from '@/lib/attestations';
 import { decodeRequest } from '@/lib/encode';
 import { proveIncomeAtLeast } from '@/lib/prove';
+import { loadAddressesBrowser } from '@/lib/midnight/addresses';
 import { getDemoIssuers, type DemoIssuer } from '@/lib/issuers';
 import { appendHistory, fromProof } from '@/lib/history';
 import type { Attestation, ProofPackage, VerificationRequest } from '@/lib/schemas';
@@ -97,10 +98,17 @@ export const HolderFlow = () => {
     setPhase({ kind: 'proving' });
     const startedAt = Date.now();
     const issuer = issuers.find((i) => i.issuerId === selected.issuerId);
+    // If contracts are deployed AND a wallet is connected, route through the
+    // real circuit; otherwise prove.ts falls back to the sha256 mock with
+    // identical public-input shape.
+    const addresses = loadAddressesBrowser();
     const result = await proveIncomeAtLeast({
       attestation: selected,
       request,
       issuerLabel: issuer?.label ?? 'unknown issuer',
+      ...(wallet.walletApi && addresses
+        ? { walletApi: wallet.walletApi, addresses }
+        : {}),
     });
 
     const elapsed = Date.now() - startedAt;
